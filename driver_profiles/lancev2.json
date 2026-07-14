@@ -1,0 +1,8 @@
+{
+  "driver_id": "lancev2",
+  "display_name": "lancev2",
+  "pitch_offset_deg": 175.15847511549785,
+  "roll_offset_deg": 1.4913511147746779,
+  "ear_closed_threshold": 0.15615577320068247,
+  "calibrated_at": "2026-07-13T08:38:18.383389+00:00"
+}

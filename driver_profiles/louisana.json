@@ -1,0 +1,8 @@
+{
+  "driver_id": "louisana",
+  "display_name": "Louisana",
+  "pitch_offset_deg": 170.40224020645957,
+  "roll_offset_deg": 0.13290207162647366,
+  "ear_closed_threshold": 0.17530639702563877,
+  "calibrated_at": "2026-07-14T04:46:51.164550+00:00"
+}
