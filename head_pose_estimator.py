@@ -32,6 +32,28 @@ phase) record a real "neutral" baseline and subtract it from every reading
 before the breach thresholds are applied, which corrects for this without
 touching the underlying PnP math or its unit tests (offsets default to 0.0,
 so existing synthetic round-trip tests are unaffected).
+
+SIDE-GLANCE FALSE POSITIVE (mirror checks): real-world testing also showed
+LAYER2 firing when the driver briefly turns to check a side mirror - a
+yaw-dominant motion, not drowsy head droop. Two causes: (1) at large yaw
+angles, the fixed-order Euler decomposition above can leak into the
+reported pitch/roll even when the head hasn't actually tilted, and (2) a
+single frame crossing the threshold was enough to fire an alert instantly,
+with no allowance for a quick, intentional glance. This is addressed with
+two additions, both opt-in via constructor defaults so existing callers and
+synthetic unit tests are unaffected:
+
+  - yaw_suppression_deg: pitch/roll breaches are only honored while
+    |yaw| stays under this value. Beyond it, the driver is almost
+    certainly looking somewhere on purpose (mirror, blind spot), and the
+    pitch/roll readings are geometrically less trustworthy anyway.
+  - min_breach_duration_seconds: a pitch/roll breach must persist
+    continuously for this long (tracked via the optional `timestamp`
+    argument to compute()) before it counts as a real breach, mirroring
+    the same rolling-window philosophy PERCLOSCalculator already uses for
+    eye closure. If no timestamp is supplied, compute() falls back to
+    instantaneous evaluation (this is what the synthetic round-trip tests
+    do, since they only care about a single frame's geometry).
 """
 
 from __future__ import annotations
@@ -81,6 +103,17 @@ MODEL_POINTS = np.array(
 PITCH_THRESHOLD_DEG = 15.0
 ROLL_THRESHOLD_DEG = 20.0
 
+# Beyond this yaw, the driver is almost certainly glancing somewhere on
+# purpose (side mirror, blind spot) rather than drooping - suppress the
+# pitch/roll breach check while yaw is this large.
+YAW_SUPPRESSION_DEG = 30.0
+
+# A pitch/roll breach must persist at least this long (seconds) before it
+# counts as real, filtering out brief voluntary glances. Only enforced when
+# compute() is given a timestamp; omitted timestamps (synthetic unit tests)
+# fall back to instantaneous evaluation.
+MIN_BREACH_DURATION_SECONDS = 1.2
+
 
 @dataclass
 class HeadPoseResult:
@@ -118,11 +151,16 @@ class HeadPoseEstimator:
         roll_threshold_deg: float = ROLL_THRESHOLD_DEG,
         pitch_offset_deg: float = 0.0,
         roll_offset_deg: float = 0.0,
+        yaw_suppression_deg: float = YAW_SUPPRESSION_DEG,
+        min_breach_duration_seconds: float = MIN_BREACH_DURATION_SECONDS,
     ):
         self.pitch_threshold_deg = pitch_threshold_deg
         self.roll_threshold_deg = roll_threshold_deg
         self.pitch_offset_deg = pitch_offset_deg
         self.roll_offset_deg = roll_offset_deg
+        self.yaw_suppression_deg = yaw_suppression_deg
+        self.min_breach_duration_seconds = min_breach_duration_seconds
+        self._breach_start_time = None
 
     def calibrate(self, pitch_offset_deg: float, roll_offset_deg: float) -> None:
         """
@@ -134,6 +172,9 @@ class HeadPoseEstimator:
         """
         self.pitch_offset_deg = pitch_offset_deg
         self.roll_offset_deg = roll_offset_deg
+        # A fresh calibration means any in-progress breach timer is based on
+        # stale (uncalibrated) readings - reset it so we don't fire early.
+        self._breach_start_time = None
 
     @staticmethod
     def _camera_matrix(image_width: int, image_height: int) -> np.ndarray:
@@ -156,11 +197,18 @@ class HeadPoseEstimator:
         landmarks: Sequence[LandmarkLike],
         image_width: int,
         image_height: int,
+        timestamp: float = None,
     ) -> HeadPoseResult:
         """
         landmarks: MediaPipe's face_landmarks.landmark list (normalized 0-1),
             i.e. results.multi_face_landmarks[0].landmark.
         image_width / image_height: source frame dimensions in pixels.
+        timestamp: monotonic seconds (e.g. time.monotonic()) for the sustained-
+            duration breach gate. Optional - omit for one-off/synthetic calls,
+            in which case breach is evaluated instantaneously (yaw suppression
+            still applies either way). Pass it consistently across calls on
+            the same estimator instance in real usage (see live_demo.py) so
+            the duration timer is measured correctly.
         """
         image_points = np.array(
             [
@@ -199,5 +247,26 @@ class HeadPoseEstimator:
         pitch = raw_pitch - self.pitch_offset_deg
         roll = raw_roll - self.roll_offset_deg
 
-        breached = abs(pitch) > self.pitch_threshold_deg or abs(roll) > self.roll_threshold_deg
+        # Yaw gate: a large sideways turn (mirror/blind-spot check) suppresses
+        # the pitch/roll breach check entirely - both because that's normal,
+        # intentional driving behavior, and because pitch/roll readings are
+        # geometrically less reliable at large yaw (Euler decomposition
+        # coupling - see module docstring).
+        within_yaw_range = abs(yaw) <= self.yaw_suppression_deg
+        instantaneous_breach = within_yaw_range and (
+            abs(pitch) > self.pitch_threshold_deg or abs(roll) > self.roll_threshold_deg
+        )
+
+        if timestamp is None:
+            # No timestamp given (e.g. synthetic unit tests calling compute()
+            # once in isolation) - evaluate instantaneously, same as before.
+            breached = instantaneous_breach
+        elif instantaneous_breach:
+            if self._breach_start_time is None:
+                self._breach_start_time = timestamp
+            breached = (timestamp - self._breach_start_time) >= self.min_breach_duration_seconds
+        else:
+            self._breach_start_time = None
+            breached = False
+
         return HeadPoseResult(pitch=pitch, yaw=yaw, roll=roll, breached=breached)

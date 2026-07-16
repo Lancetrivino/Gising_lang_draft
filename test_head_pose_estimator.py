@@ -1,10 +1,14 @@
 """
 Unit tests for HeadPoseEstimator - implements test cases UT-04 and UT-05 from
-the GisingLang Software Testing document (Table 5), plus coverage for the
-calibrate() baseline-offset feature added after real-webcam testing showed a
-systematic bias (a generic 3D face model + uncalibrated focal length doesn't
-read exactly 0 degrees for every real face/camera - see the comment at the
-top of head_pose_estimator.py).
+the GisingLang Software Testing document (Table 5), plus coverage for:
+
+  - calibrate(): the baseline-offset feature added after real-webcam testing
+    showed a systematic bias (a generic 3D face model + uncalibrated focal
+    length doesn't read exactly 0 degrees for every real face/camera).
+  - yaw_suppression_deg + min_breach_duration_seconds: added after real-
+    webcam testing showed LAYER2 firing when the driver briefly turned to
+    check a side mirror (yaw-dominant motion, not drowsy head droop). See
+    the module docstring in head_pose_estimator.py for the full rationale.
 
 Requires opencv-python and numpy (pip install opencv-python numpy) since
 HeadPoseEstimator uses cv2.solvePnP / cv2.Rodrigues.
@@ -137,3 +141,91 @@ def test_calibrate_cancels_a_systematic_bias():
     tilted_result = estimator.compute(tilted_landmarks, IMAGE_WIDTH, IMAGE_HEIGHT)
     assert math.isclose(tilted_result.pitch, 20.0, abs_tol=1.0), tilted_result.pitch
     assert tilted_result.breached is True
+
+
+def test_default_yaw_suppression_and_duration_are_set():
+    estimator = HeadPoseEstimator()
+    assert estimator.yaw_suppression_deg == 30.0
+    assert estimator.min_breach_duration_seconds == 1.2
+
+
+def test_side_mirror_glance_does_not_breach_even_with_pitch_drift():
+    # Simulate the reported bug: turning to check a side mirror is yaw-
+    # dominant (35 deg), but Euler-decomposition coupling also leaks into
+    # the reported pitch (18 deg here, which alone would cross the 15 deg
+    # threshold). The yaw gate should suppress the breach regardless,
+    # since |yaw|=35 is past yaw_suppression_deg=30 - a real mirror check,
+    # not a drowsy droop. No timestamp is passed, so this also confirms the
+    # yaw gate applies even in the instantaneous (no-duration-gate) path.
+    estimator = HeadPoseEstimator()
+    landmarks = _make_landmarks_for_pose(pitch_deg=18.0, yaw_deg=35.0, roll_deg=0.0)
+
+    result = estimator.compute(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT)
+
+    assert result.breached is False, (result.pitch, result.yaw, result.roll)
+
+
+def test_forward_pitch_breach_still_fires_within_yaw_range():
+    # Sanity check the yaw gate isn't over-broad: a genuine forward droop
+    # with yaw well within range must still breach instantaneously.
+    estimator = HeadPoseEstimator()
+    landmarks = _make_landmarks_for_pose(pitch_deg=20.0, yaw_deg=5.0, roll_deg=0.0)
+
+    result = estimator.compute(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT)
+
+    assert result.breached is True
+
+
+def test_duration_gate_requires_sustained_breach_before_firing():
+    # A pitch breach that has only just started (elapsed < 1.2s) must not
+    # yet report breached=True - this is what stops a single bad/borderline
+    # frame from instantly triggering LAYER2.
+    estimator = HeadPoseEstimator()
+    landmarks = _make_landmarks_for_pose(pitch_deg=20.0, yaw_deg=0.0, roll_deg=0.0)
+
+    first = estimator.compute(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=0.0)
+    assert first.breached is False, "single frame should not breach instantly when timed"
+
+    still_early = estimator.compute(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=0.5)
+    assert still_early.breached is False, "0.5s of sustained tilt is still under the 1.2s gate"
+
+    now_sustained = estimator.compute(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=1.3)
+    assert now_sustained.breached is True, "1.3s of continuous tilt should finally breach"
+
+
+def test_duration_gate_resets_on_brief_correction():
+    # A brief return to normal head pose mid-tilt should reset the timer,
+    # so a driver who over-corrects and then droops again doesn't get
+    # credit for the earlier, interrupted tilt.
+    estimator = HeadPoseEstimator()
+    tilted = _make_landmarks_for_pose(pitch_deg=20.0, yaw_deg=0.0, roll_deg=0.0)
+    neutral = _make_landmarks_for_pose(pitch_deg=0.0, yaw_deg=0.0, roll_deg=0.0)
+
+    estimator.compute(tilted, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=0.0)
+    mid = estimator.compute(tilted, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=1.0)
+    assert mid.breached is False  # only 1.0s in, under the 1.2s gate
+
+    # Driver straightens up briefly, resetting the timer.
+    estimator.compute(neutral, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=1.1)
+
+    # Tilts again - even though 1.3s have passed since the *original* tilt
+    # started, the timer restarted at the correction, so this should not
+    # yet breach.
+    resumed = estimator.compute(tilted, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=1.3)
+    assert resumed.breached is False, "timer should have reset at the brief correction"
+
+    finally_sustained = estimator.compute(tilted, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=2.5)
+    assert finally_sustained.breached is True
+
+
+def test_mirror_glance_with_timestamp_never_accumulates_toward_breach():
+    # End-to-end style check: repeatedly "glancing" at a side mirror for
+    # a couple of seconds (yaw-dominant, brief) should never breach, even
+    # when timestamps are supplied and the glance is held for longer than
+    # the duration gate would normally require.
+    estimator = HeadPoseEstimator()
+    glance = _make_landmarks_for_pose(pitch_deg=10.0, yaw_deg=35.0, roll_deg=0.0)
+
+    for t in (0.0, 0.5, 1.0, 1.5, 2.0):
+        result = estimator.compute(glance, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=t)
+        assert result.breached is False, f"false breach at t={t}"

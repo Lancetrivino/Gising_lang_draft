@@ -42,6 +42,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 import cv2
+
 import mediapipe as mp
 
 from alert_manager import AlertManager

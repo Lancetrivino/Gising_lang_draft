@@ -1,19 +1,25 @@
 """
 Integration test for DetectionController - implements test case IT-08 from
-the GisingLang Software Testing document (Table 6):
+the GisingLang Software Testing document, plus two new regression tests for
+the mirror-glance (LAYER2) and sticky-LAYER1 fixes at the full-pipeline
+level (not just the unit level), confirming the timestamp is correctly
+threaded through process_frame() into both PERCLOSCalculator and the new
+HeadPoseEstimator duration gate.
 
-    "Full Pipeline (Camera -> Classifier -> Alert -> Cloud -> SMS): Verify
-    an end-to-end simulated drowsiness event produces the correct alert, log
-    entry, and notification in sequence."
+NOTE ON SHARED LANDMARK INDICES: real MediaPipe topology has landmark 33
+serve double duty as the right eye's outer corner (EARCalculator's
+RIGHT_EYE P1) and as HeadPoseEstimator's "left_eye_outer" reference point;
+landmark 263 is EARCalculator's LEFT_EYE P4 and HeadPoseEstimator's
+"right_eye_outer" - the same physical point on a real face, correctly
+shared. In these synthetic fixtures that means head pose must be applied
+*before* the eye-openness landmarks are built, and the eye fixture must
+anchor off wherever head pose actually placed landmarks 33/263, rather than
+an independent fixed position - otherwise the two setup steps silently
+clobber each other's landmarks and produce nonsense EAR/pose readings.
 
-(Cloud/SMS delivery are covered separately by test_cloud_logger.py and
-test_cloud_notifier.py - this test covers the camera -> classifier -> alert
-portion of the chain, since that's what DetectionController itself owns.)
-
-Builds one synthetic landmark set representing BOTH closed eyes AND a
-20-degree forward head tilt at the same time - i.e. a COMBINED-alert frame -
-using the same round-trip projection technique as test_head_pose_estimator.py.
-No webcam, no MediaPipe, no Raspberry Pi required.
+NOTE ON FakeGPIOBackend.history: this project's FakeGPIOBackend records
+history as 2-tuples (pin, high) - not (action, pin, high). Assertions below
+index accordingly (evt[0]=pin, evt[1]=high).
 
 Run with:  pytest test_detection_pipeline.py -v
 """
@@ -24,7 +30,7 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
-from alert_manager import BUZZER_PIN, MOTOR_PIN, AlertManager
+from alert_manager import AlertManager
 from detection_pipeline import DetectionController
 from drowsiness_classifier import AlertLevel, DrowsinessClassifier
 from ear_calculator import EARCalculator, LEFT_EYE_INDICES, RIGHT_EYE_INDICES
@@ -37,61 +43,63 @@ IMAGE_HEIGHT = 480
 NUM_LANDMARKS = 468
 TRANSLATION = np.array([[0.0], [0.0], [600.0]])
 
+EYE_CORNER_GAP = 0.12  # normalized horizontal separation between P1/P4
+OPEN_VERTICAL_GAP = 0.05
+CLOSED_VERTICAL_GAP = 0.003
 
-def _camera_matrix() -> np.ndarray:
+
+def _camera_matrix():
     focal_length = IMAGE_WIDTH
     center = (IMAGE_WIDTH / 2.0, IMAGE_HEIGHT / 2.0)
-    return np.array([[focal_length, 0.0, center[0]], [0.0, focal_length, center[1]], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return np.array(
+        [[focal_length, 0.0, center[0]], [0.0, focal_length, center[1]], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
 
 
-def _make_combined_breach_landmarks(pitch_deg: float, eyes_closed: bool) -> list:
-    """
-    Builds a synthetic 468-slot landmark list representing a driver tilted
-    forward by pitch_deg with eyes closed (or open, if eyes_closed=False).
+def _base_landmarks():
+    return [SimpleNamespace(x=0.5, y=0.5) for _ in range(NUM_LANDMARKS)]
 
-    The 6 head-pose landmarks (including the shared eye-corner indices 33
-    and 263) are placed via a real cv2.projectPoints round-trip, exactly
-    like test_head_pose_estimator.py, so HeadPoseEstimator recovers the
-    correct pitch. The remaining EAR-only eyelid landmarks are then placed
-    as small vertical offsets to represent open/closed eyes - EAR is driven
-    almost entirely by that vertical gap, so this doesn't fight the head
-    pose projection.
-    """
-    rotation_vector = np.array([[math.radians(pitch_deg)], [0.0], [0.0]])
-    camera_matrix = _camera_matrix()
+
+def _set_head_pose(landmarks, pitch_deg, yaw_deg, roll_deg):
+    rotation_vector = np.array(
+        [[math.radians(pitch_deg)], [math.radians(yaw_deg)], [math.radians(roll_deg)]]
+    )
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
-
-    image_points, _ = cv2.projectPoints(MODEL_POINTS, rotation_vector, TRANSLATION, camera_matrix, dist_coeffs)
+    image_points, _ = cv2.projectPoints(
+        MODEL_POINTS, rotation_vector, TRANSLATION, _camera_matrix(), dist_coeffs
+    )
     image_points = image_points.reshape(-1, 2)
-
-    landmarks = [SimpleNamespace(x=0.0, y=0.0) for _ in range(NUM_LANDMARKS)]
     ordered_names = ("nose_tip", "chin", "left_eye_outer", "right_eye_outer", "left_mouth", "right_mouth")
     for name, (px, py) in zip(ordered_names, image_points):
         idx = LANDMARK_INDICES[name]
         landmarks[idx] = SimpleNamespace(x=px / IMAGE_WIDTH, y=py / IMAGE_HEIGHT)
 
-    # left_eye_outer (362, EAR's P1) and right_eye_outer (133, EAR's P4)
-    # aren't part of the head-pose 6-point set, so they're free to place
-    # independently near the projected eye-corner points.
-    right_p1 = landmarks[RIGHT_EYE_INDICES["P1"]]  # = landmarks[33], already set above
-    left_p4 = landmarks[LEFT_EYE_INDICES["P4"]]  # = landmarks[263], already set above
-    landmarks[RIGHT_EYE_INDICES["P4"]] = SimpleNamespace(x=right_p1.x + 0.05, y=right_p1.y)
-    landmarks[LEFT_EYE_INDICES["P1"]] = SimpleNamespace(x=left_p4.x - 0.05, y=left_p4.y)
 
-    half_gap = 0.018 if not eyes_closed else 0.003  # matches test_ear_calculator.py's open/closed values
+def _set_eyes(landmarks, closed: bool):
+    """Must be called AFTER _set_head_pose(). Anchors the eye shape off
+    whichever pixel position head pose already assigned to the two shared
+    corner landmarks (33 = right eye P1, 263 = left eye P4), and only
+    writes to the remaining EAR landmarks, which head pose never touches."""
+    vertical_gap = CLOSED_VERTICAL_GAP if closed else OPEN_VERTICAL_GAP
 
-    def set_eyelids(indices: dict, corner_x_a: float, corner_x_b: float, corner_y: float) -> None:
-        mid_x_upper = (corner_x_a + corner_x_b) / 2.0 - 0.01
-        mid_x_lower = (corner_x_a + corner_x_b) / 2.0 + 0.01
-        landmarks[indices["P2"]] = SimpleNamespace(x=mid_x_upper, y=corner_y - half_gap)
-        landmarks[indices["P3"]] = SimpleNamespace(x=mid_x_lower, y=corner_y - half_gap)
-        landmarks[indices["P5"]] = SimpleNamespace(x=mid_x_lower, y=corner_y + half_gap)
-        landmarks[indices["P6"]] = SimpleNamespace(x=mid_x_upper, y=corner_y + half_gap)
+    p1 = landmarks[RIGHT_EYE_INDICES["P1"]]
+    p4x, p4y = p1.x + EYE_CORNER_GAP, p1.y
+    landmarks[RIGHT_EYE_INDICES["P4"]] = SimpleNamespace(x=p4x, y=p4y)
+    mid_x = (p1.x + p4x) / 2.0
+    landmarks[RIGHT_EYE_INDICES["P2"]] = SimpleNamespace(x=mid_x - 0.02, y=p1.y - vertical_gap)
+    landmarks[RIGHT_EYE_INDICES["P3"]] = SimpleNamespace(x=mid_x + 0.02, y=p1.y - vertical_gap)
+    landmarks[RIGHT_EYE_INDICES["P5"]] = SimpleNamespace(x=mid_x + 0.02, y=p1.y + vertical_gap)
+    landmarks[RIGHT_EYE_INDICES["P6"]] = SimpleNamespace(x=mid_x - 0.02, y=p1.y + vertical_gap)
 
-    set_eyelids(RIGHT_EYE_INDICES, landmarks[RIGHT_EYE_INDICES["P1"]].x, landmarks[RIGHT_EYE_INDICES["P4"]].x, right_p1.y)
-    set_eyelids(LEFT_EYE_INDICES, landmarks[LEFT_EYE_INDICES["P1"]].x, landmarks[LEFT_EYE_INDICES["P4"]].x, left_p4.y)
-
-    return landmarks
+    p4 = landmarks[LEFT_EYE_INDICES["P4"]]
+    p1x, p1y = p4.x - EYE_CORNER_GAP, p4.y
+    landmarks[LEFT_EYE_INDICES["P1"]] = SimpleNamespace(x=p1x, y=p1y)
+    mid_x = (p1x + p4.x) / 2.0
+    landmarks[LEFT_EYE_INDICES["P2"]] = SimpleNamespace(x=mid_x - 0.02, y=p4.y - vertical_gap)
+    landmarks[LEFT_EYE_INDICES["P3"]] = SimpleNamespace(x=mid_x + 0.02, y=p4.y - vertical_gap)
+    landmarks[LEFT_EYE_INDICES["P5"]] = SimpleNamespace(x=mid_x + 0.02, y=p4.y + vertical_gap)
+    landmarks[LEFT_EYE_INDICES["P6"]] = SimpleNamespace(x=mid_x - 0.02, y=p4.y + vertical_gap)
 
 
 def _make_controller():
@@ -106,36 +114,83 @@ def _make_controller():
     return controller, gpio
 
 
-def test_combined_breach_fires_both_actuators_matches_it08():
+def test_it08_combined_breach_fires_both_actuators():
     controller, gpio = _make_controller()
 
-    # Feed enough closed-eye, tilted-head frames to push PERCLOS over 20%
-    # within the 60s rolling window (a single frame isn't enough - PERCLOS
-    # needs a history), then confirm the final frame produces COMBINED.
-    landmarks = _make_combined_breach_landmarks(pitch_deg=20.0, eyes_closed=True)
+    landmarks = _base_landmarks()
+    _set_head_pose(landmarks, pitch_deg=20.0, yaw_deg=0.0, roll_deg=0.0)
+    _set_eyes(landmarks, closed=True)
+
     result = None
-    for i in range(10):
-        result = controller.process_frame(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=i * 0.5)
+    for i in range(30):  # ~1.5s at 20 samples/sec - past both duration gates
+        t = i * 0.05
+        result = controller.process_frame(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=t)
 
-    assert result.ear_result.eye_closed is True
-    assert result.perclos_result.breached is True
-    assert result.head_pose_result.breached is True
-    assert result.classification.alert_level is AlertLevel.COMBINED
-
-    # AlertManager actually pulsed both GPIO pins.
     import time
-    time.sleep(1.2)  # let the daemon threads finish their 1000ms pulse
-    assert (BUZZER_PIN, True) in gpio.history
-    assert (MOTOR_PIN, True) in gpio.history
+
+    time.sleep(1.2)  # let the daemon alert threads finish their pulses
+
+    assert result.classification.alert_level is AlertLevel.COMBINED, result.classification
+    assert gpio.pin_states[18] is False  # pulse already completed and released
+    assert any(evt[0] == 18 and evt[1] is True for evt in gpio.history)
+    assert any(evt[0] == 24 and evt[1] is True for evt in gpio.history)
+
+    controller.alert_manager.shutdown()
 
 
-def test_alert_face_produces_no_alert():
+def test_alert_face_returns_to_none():
     controller, gpio = _make_controller()
 
-    landmarks = _make_combined_breach_landmarks(pitch_deg=0.0, eyes_closed=False)
+    landmarks = _base_landmarks()
+    _set_head_pose(landmarks, pitch_deg=0.0, yaw_deg=0.0, roll_deg=0.0)
+    _set_eyes(landmarks, closed=False)
+
     result = controller.process_frame(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=0.0)
 
-    assert result.ear_result.eye_closed is False
-    assert result.head_pose_result.breached is False
-    assert result.classification.alert_level is AlertLevel.NONE
-    assert gpio.history == []
+    assert result.classification.alert_level is AlertLevel.NONE, result.classification
+
+    controller.alert_manager.shutdown()
+
+
+def test_mirror_glance_never_reaches_layer2_through_full_pipeline():
+    controller, gpio = _make_controller()
+
+    landmarks = _base_landmarks()
+    _set_head_pose(landmarks, pitch_deg=12.0, yaw_deg=35.0, roll_deg=0.0)
+    _set_eyes(landmarks, closed=False)
+
+    for i in range(40):  # ~2s of continuous "mirror glance"
+        t = i * 0.05
+        result = controller.process_frame(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=t)
+        assert result.classification.alert_level is AlertLevel.NONE, (
+            f"false LAYER2 at frame {i}: {result.classification} / pose={result.head_pose_result}"
+        )
+
+    controller.alert_manager.shutdown()
+
+
+def test_layer1_clears_promptly_after_reopening_eyes_through_full_pipeline():
+    controller, gpio = _make_controller()
+
+    landmarks = _base_landmarks()
+    _set_head_pose(landmarks, pitch_deg=0.0, yaw_deg=0.0, roll_deg=0.0)
+
+    _set_eyes(landmarks, closed=True)
+    t = 0.0
+    result = None
+    for i in range(20):
+        result = controller.process_frame(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=t)
+        t += 0.1
+    assert result.classification.alert_level is AlertLevel.LAYER1, result.classification
+
+    _set_eyes(landmarks, closed=False)
+    for i in range(40):
+        result = controller.process_frame(landmarks, IMAGE_WIDTH, IMAGE_HEIGHT, timestamp=t)
+        t += 0.1
+
+    assert result.classification.alert_level is AlertLevel.NONE, (
+        "LAYER1 should have cleared once eyes were sustained-open, "
+        f"but still reports {result.classification.alert_level}"
+    )
+
+    controller.alert_manager.shutdown()

@@ -1,40 +1,29 @@
 """
-DetectionController's per-frame orchestration logic, per the GisingLang
-thesis (Chapter 3):
+DetectionController - orchestrates one full frame through the GisingLang
+detection pipeline: EAR -> PERCLOS -> head pose -> classification -> alert.
 
-    "The central class is the DetectionController, which acts as the main
-    processor and coordinates camera frame capture and the full computer
-    vision pipeline."
+Corresponds to test case IT-08 in the Software Testing document.
 
-This module intentionally has NO camera, MediaPipe, or GPIO-library
-dependency of its own - it just wires together the modules we've already
-built and tested (EARCalculator, PERCLOSCalculator, HeadPoseEstimator,
-DrowsinessClassifier, AlertManager) for a single frame's worth of landmarks.
-That keeps it fully unit testable with synthetic landmarks, matching
-integration test case IT-08 in the Software Testing document ("Full
-Pipeline"), with no webcam required.
-
-live_demo.py is the thin camera/display wrapper that calls process_frame()
-in a loop using a real webcam and MediaPipe - that's the part you can't unit
-test without a camera, so it stays as small as possible.
+TIMESTAMP NOTE: `timestamp` is forwarded to both PERCLOSCalculator.update()
+(required - it's how the rolling window works) and, as of the mirror-glance
+fix, to HeadPoseEstimator.compute() as well. Without that second forward,
+HeadPoseEstimator falls back to its instantaneous (no-duration-gate)
+evaluation path, which would silently disable the new sustained-breach
+requirement during real runs through live_demo.py - the duration gate would
+still pass its own unit tests (which call it directly with timestamps) but
+would never actually engage in the live pipeline. Pass a real, monotonically
+non-decreasing timestamp (e.g. time.monotonic()) every frame.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
-from typing import Protocol, Sequence
 
 from alert_manager import AlertManager
 from drowsiness_classifier import ClassificationResult, DrowsinessClassifier
 from ear_calculator import EARCalculator, EARResult
 from head_pose_estimator import HeadPoseEstimator, HeadPoseResult
 from perclos_calculator import PERCLOSCalculator, PERCLOSResult
-
-
-class LandmarkLike(Protocol):
-    x: float
-    y: float
 
 
 @dataclass
@@ -46,9 +35,6 @@ class FrameResult:
 
 
 class DetectionController:
-    """Coordinates one frame's worth of landmarks through the full
-    EAR -> PERCLOS -> head pose -> classifier -> alert pipeline."""
-
     def __init__(
         self,
         ear_calculator: EARCalculator,
@@ -65,25 +51,20 @@ class DetectionController:
 
     def process_frame(
         self,
-        landmarks: Sequence[LandmarkLike],
+        landmarks,
         image_width: int,
         image_height: int,
-        timestamp: float | None = None,
+        timestamp: float = None,
     ) -> FrameResult:
-        """
-        Runs one frame's landmarks through the full pipeline and fires the
-        AlertManager if a breach is classified. Returns every intermediate
-        result too, so callers (live_demo.py, tests) can inspect or display
-        them without recomputing anything.
-        """
-        if timestamp is None:
-            timestamp = time.monotonic()
-
         ear_result = self.ear_calculator.compute(landmarks, image_width, image_height)
         perclos_result = self.perclos_calculator.update(timestamp, ear_result.eye_closed)
-        head_pose_result = self.head_pose_estimator.compute(landmarks, image_width, image_height)
-        classification = self.classifier.classify(perclos_result.breached, head_pose_result.breached)
-
+        head_pose_result = self.head_pose_estimator.compute(
+            landmarks, image_width, image_height, timestamp=timestamp
+        )
+        classification = self.classifier.classify(
+            perclos_breached=perclos_result.breached,
+            head_pose_breached=head_pose_result.breached,
+        )
         self.alert_manager.trigger(classification, blocking=False)
 
         return FrameResult(
